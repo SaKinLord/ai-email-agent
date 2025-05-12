@@ -1,0 +1,11 @@
+venv/
+.env
+credentials.json
+token.json
+__pycache__/
+*.pyc
+retrain_state.json
+*.joblib
+*.pkl
+.DS_Store
+*.log.vs/ 
