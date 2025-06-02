@@ -39,5 +39,5 @@ An intelligent email management assistant powered by Claude AI and Gmail API tha
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/SaKinLord/ai-email-agent/edit/main/README.md
+   git clone https://github.com/SaKinLord/ai-email-agent
    cd ai-email-agent
