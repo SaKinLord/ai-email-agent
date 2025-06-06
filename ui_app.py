@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import streamlit as st
 import pyperclip
-# --- REMOVED dark_theme import ---
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 # --- SET PAGE CONFIG FIRST ---
 st.set_page_config(
@@ -376,7 +376,8 @@ import json
 import re
 import sys
 import random
-
+print(f"Python Executable: {sys.executable}")
+print(f"Streamlit Version in use: {st.__version__}")
 from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build as build_service # Add this
 from google.oauth2.credentials import Credentials # Add this
@@ -953,21 +954,25 @@ def fetch_recent_emails(limit=50):
         return pd.DataFrame()
 
 @st.cache_data(ttl=60)
-def fetch_emails_by_purpose(purpose_type, limit=20):
-    """Fetch emails filtered by purpose"""
+def fetch_emails_by_purpose(purpose_type, limit=20, days_recent=30): # Add days_recent parameter
     if not db: return pd.DataFrame()
     
     try:
-        logging.info(f"Fetching up to {limit} emails with purpose: {purpose_type}")
+        logging.info(f"Fetching up to {limit} emails with purpose: {purpose_type} from last {days_recent} days")
         
-        # Query with filter
         query = db.collection(EMAILS_COLLECTION)
         
-        # Add purpose filter if specified
+        # Add recency filter
+        if days_recent is not None:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_recent)
+            query = query.where(filter=FieldFilter('processed_timestamp', '>=', cutoff_date)) # Use FieldFilter
+
         if purpose_type and purpose_type != "All":
-            query = query.where('llm_purpose', '==', purpose_type)
+            query = query.where(filter=FieldFilter('llm_purpose', '==', purpose_type)) # Use FieldFilter
         
         # Order and limit
+        # IMPORTANT: If you have an inequality filter (like processed_timestamp >= cutoff_date),
+        # your first orderBy must be on that same field.
         query = query.order_by('processed_timestamp', direction=firestore.Query.DESCENDING).limit(limit)
         
         # Process results
@@ -1114,12 +1119,14 @@ def handle_editor_changes():
     
     # Add a message to the chat about feedback
     if items_added_to_pending > 0:
-        feedback_message = {
-            "role": "assistant",
-            "content": f"I noticed you provided feedback on {items_added_to_pending} email{'s' if items_added_to_pending > 1 else ''}. Thanks for helping me learn! I'll adjust my classification for similar emails in the future.",
-            "context": {"hint": "feedback_received", "data": None}
-        }
-        st.session_state[CHAT_HISTORY_KEY].append(feedback_message)
+        # --- START OF SECTION TO REMOVE/COMMENT ---
+        # feedback_message = {
+        #     "role": "assistant",
+        #     "content": f"I noticed you provided feedback on {items_added_to_pending} email{'s' if items_added_to_pending > 1 else ''}. Thanks for helping me learn! I'll adjust my classification for similar emails in the future.",
+        #     "context": {"hint": "feedback_received", "data": None}
+        # }
+        # st.session_state[CHAT_HISTORY_KEY].append(feedback_message)
+        # --- END OF SECTION TO REMOVE/COMMENT ---
         
         # Remember current tab for after rerun
         st.session_state[CURRENT_TAB_KEY] = 1  # Tab index for Email Feedback
@@ -1436,29 +1443,18 @@ def render_autonomous_tab():
 
     user_profile_data = memory.user_profile if memory.user_profile else {}
     agent_prefs = user_profile_data.get("agent_preferences", {})
-    autonomous_settings = user_profile_data.get("autonomous_settings", {})
+    # autonomous_settings = user_profile_data.get("autonomous_settings", {}) # Already defined
 
     # --- Autonomous Mode Toggle ---
-    # 1. Determine the initial value for the session state based on persisted data
+    # ... (existing toggle logic remains the same) ...
     persisted_autonomous_mode = agent_prefs.get("autonomous_mode_enabled", False)
-
-    # 2. Initialize st.session_state["autonomous_mode"] ONCE per session if not set,
-    #    using the persisted value.
     if "autonomous_mode_initialized_from_persisted" not in st.session_state:
         st.session_state["autonomous_mode"] = persisted_autonomous_mode
-        st.session_state["autonomous_mode_initialized_from_persisted"] = True # Mark as initialized
-
-    # 3. The st.toggle widget directly modifies st.session_state["autonomous_mode"]
-    #    We use a callback to handle the logic *after* the toggle changes its state.
+        st.session_state["autonomous_mode_initialized_from_persisted"] = True
 
     def autonomous_mode_on_change():
-        # This callback runs *after* st.session_state["autonomous_mode_main_toggle_key"] is updated by Streamlit
-        current_ui_toggle_state = st.session_state.autonomous_mode_main_toggle_key # Get the new state from the widget
-        
-        # Update the general session state variable we use elsewhere
+        current_ui_toggle_state = st.session_state.autonomous_mode_main_toggle_key
         st.session_state["autonomous_mode"] = current_ui_toggle_state
-
-        # Save the new state to Firestore
         if memory.save_profile_updates({"agent_preferences.autonomous_mode_enabled": current_ui_toggle_state}):
             if current_ui_toggle_state:
                 st.toast("Autonomous mode enabled and preference saved!", icon="🤖")
@@ -1469,19 +1465,15 @@ def render_autonomous_tab():
             memory.user_profile["agent_preferences"]["autonomous_mode_enabled"] = current_ui_toggle_state
         else:
             st.error("Failed to save autonomous mode preference.")
-            # Optionally revert UI if save fails - tricky with callbacks, toast might be enough
-            # st.session_state["autonomous_mode"] = not current_ui_toggle_state # Revert general state
-            # Need to also revert st.session_state.autonomous_mode_main_toggle_key, which is harder.
 
     st.toggle(
         "Enable Autonomous Mode",
-        value=st.session_state["autonomous_mode"], # Read from our general session state variable
-        key="autonomous_mode_main_toggle_key",    # Key for the widget itself
-        on_change=autonomous_mode_on_change,      # Callback to handle saving
+        value=st.session_state["autonomous_mode"],
+        key="autonomous_mode_main_toggle_key",
+        on_change=autonomous_mode_on_change,
         help="When enabled, Maia will be more proactive and can take initiative based on your configured permissions and scheduled tasks."
     )
 
-    # The rest of the tab content depends on st.session_state["autonomous_mode"]
     if not st.session_state.get("autonomous_mode", False):
         st.warning("""
         Autonomous mode is currently disabled. Enable it above to allow Maia to:
@@ -1492,19 +1484,14 @@ def render_autonomous_tab():
         """)
     else:
         st.success("Autonomous mode is enabled. Maia is actively assisting with your inbox based on your configurations below.")
-        # ... (rest of your render_autonomous_tab function for when mode is enabled) ...
-        # The logic for loading/saving other settings like Proactivity Level, Permissions,
-        # and Scheduled Tasks should remain similar to the previous version,
-        # ensuring they read their initial values from `agent_prefs` or `autonomous_settings`
-        # and save changes back to `memory`.
-
-        # Example: Proactivity Level (ensure it uses st.session_state["autonomous_mode"] for disabled state)
-        st.markdown("### Autonomy Settings") # This section only shows if mode is ON
+        
+        # --- Settings for when Autonomous Mode is ON ---
+        st.markdown("### Autonomy Settings")
+        # ... (Proactivity Level, Permissions logic as before) ...
         settings_col1, settings_col2 = st.columns(2)
 
         with settings_col1:
             st.markdown("#### Proactivity Level")
-            # current_suggestion_freq is already loaded from agent_prefs at the top
             current_suggestion_freq = agent_prefs.get("suggestion_frequency", "medium")
             proactivity_map_inv = {"low": "Minimal", "medium": "Balanced", "high": "Highly Proactive"}
             current_proactivity_slider_value = proactivity_map_inv.get(current_suggestion_freq, "Balanced")
@@ -1513,35 +1500,29 @@ def render_autonomous_tab():
                 "How proactive should Maia be with suggestions?",
                 options=["Minimal", "Balanced", "Highly Proactive"],
                 value=current_proactivity_slider_value,
-                key="proactivity_level_slider",
-                disabled=not st.session_state["autonomous_mode"] # Correctly uses the session state
+                key="proactivity_level_slider_auto_tab", 
+                disabled=not st.session_state["autonomous_mode"]
             )
-            # ... (save logic for proactivity as before) ...
             suggestion_freq_map = {"Minimal": "low", "Balanced": "medium", "Highly Proactive": "high"}
             selected_freq = suggestion_freq_map[proactivity]
 
-            if selected_freq != current_suggestion_freq: # Only save if changed
+            if selected_freq != current_suggestion_freq:
                 if memory.save_profile_updates({"agent_preferences.suggestion_frequency": selected_freq}):
                     st.toast(f"Proactivity level set to: {proactivity}", icon="👍")
                     logging.info(f"UI: Saved agent_preferences.suggestion_frequency: {selected_freq}")
                     if "agent_preferences" not in memory.user_profile: memory.user_profile["agent_preferences"] = {}
                     memory.user_profile["agent_preferences"]["suggestion_frequency"] = selected_freq
-                    st.rerun() # Rerun to reflect change if necessary
+                    st.rerun()
                 else:
                     st.error("Failed to save proactivity level.")
-        
-        # ... (rest of the settings: Permissions, Scheduled Tasks, ensuring they also use
-        #      `disabled=not st.session_state["autonomous_mode"]` and load/save their
-        #      specific values from/to agent_prefs or autonomous_settings in memory.user_profile)
 
         with settings_col2:
             st.markdown("#### Autonomous Permissions")
             allow_auto_categorization_persisted = agent_prefs.get("allow_auto_categorization", True)
-            # ... (similar loading and saving for other checkboxes) ...
             new_allow_auto_categorization = st.checkbox(
                 "Allow automatic categorization (based on learning)",
-                value=allow_auto_categorization_persisted, # Load persisted
-                key="perm_auto_categorize",
+                value=allow_auto_categorization_persisted,
+                key="perm_auto_categorize_auto_tab",
                 disabled=not st.session_state["autonomous_mode"]
             )
             if new_allow_auto_categorization != allow_auto_categorization_persisted:
@@ -1553,8 +1534,8 @@ def render_autonomous_tab():
             allow_auto_priority_persisted = agent_prefs.get("allow_auto_priority", True)
             new_allow_auto_priority = st.checkbox(
                 "Allow automatic priority assignment (based on learning)",
-                value=allow_auto_priority_persisted, # Load persisted
-                key="perm_auto_priority",
+                value=allow_auto_priority_persisted,
+                key="perm_auto_priority_auto_tab",
                 disabled=not st.session_state["autonomous_mode"]
             )
             if new_allow_auto_priority != allow_auto_priority_persisted:
@@ -1566,8 +1547,8 @@ def render_autonomous_tab():
             allow_auto_archiving_persisted = agent_prefs.get("allow_auto_archiving", False)
             new_allow_auto_archiving = st.checkbox(
                 "Allow automatic archiving of low priority emails",
-                value=allow_auto_archiving_persisted, # Load persisted
-                key="perm_auto_archive",
+                value=allow_auto_archiving_persisted,
+                key="perm_auto_archive_auto_tab",
                 disabled=not st.session_state["autonomous_mode"]
             )
             if new_allow_auto_archiving != allow_auto_archiving_persisted:
@@ -1576,13 +1557,13 @@ def render_autonomous_tab():
                     if "agent_preferences" not in memory.user_profile: memory.user_profile["agent_preferences"] = {}
                     memory.user_profile["agent_preferences"]["allow_auto_archiving"] = new_allow_auto_archiving
             
-            archive_permission = new_allow_auto_archiving # For use by Auto-Archive save button
+            archive_permission = new_allow_auto_archiving
 
             allow_auto_draft_persisted = agent_prefs.get("allow_auto_draft", False)
             new_allow_auto_draft = st.checkbox(
                 "Allow automatic draft creation for simple replies",
-                value=allow_auto_draft_persisted, # Load persisted
-                key="perm_auto_draft",
+                value=allow_auto_draft_persisted,
+                key="perm_auto_draft_auto_tab",
                 disabled=not st.session_state["autonomous_mode"]
             )
             if new_allow_auto_draft != allow_auto_draft_persisted:
@@ -1594,9 +1575,8 @@ def render_autonomous_tab():
 
         st.markdown("---")
         st.markdown("### Scheduled Email Tasks")
-        # ... (Daily Summary, Auto-Archive, Follow-up sections as before,
-        #      ensuring they use `disabled=not st.session_state["autonomous_mode"]`
-        #      and also `disabled=not specific_task_enable_toggle` for their sub-controls)
+        # ... (Scheduled Tasks logic as before) ...
+        autonomous_settings = user_profile_data.get("autonomous_settings", {})
         task_col1, task_col2, task_col3 = st.columns(3)
         with task_col1:
             st.markdown("#### Daily Summary")
@@ -1612,23 +1592,23 @@ def render_autonomous_tab():
             summary_enabled_toggle = st.toggle(
                 "Enable Daily Summary",
                 value=current_summary_enabled,
-                key="daily_summary_enable_toggle_auto_on",
+                key="daily_summary_enable_toggle_auto_tab", 
                 disabled=not st.session_state["autonomous_mode"]
             )
             summary_time = st.time_input(
                 "Summary delivery time",
                 value=current_summary_time_obj,
                 disabled=not st.session_state["autonomous_mode"] or not summary_enabled_toggle,
-                key="daily_summary_time_input_auto_on"
+                key="daily_summary_time_input_auto_tab"
             )
             summary_options = st.multiselect(
                 "Include in summary",
                 ["High priority emails", "Action requests", "Questions", "Statistics", "Recommendations"],
                 default=current_summary_options,
                 disabled=not st.session_state["autonomous_mode"] or not summary_enabled_toggle,
-                key="daily_summary_options_multiselect_auto_on"
+                key="daily_summary_options_multiselect_auto_tab"
             )
-            if st.button("Save Daily Summary Settings", key="save_daily_summary_button_auto_on", disabled=not st.session_state["autonomous_mode"]):
+            if st.button("Save Daily Summary Settings", key="save_daily_summary_button_auto_tab", disabled=not st.session_state["autonomous_mode"]):
                 update_data = {
                     "autonomous_settings.daily_summary.enabled": summary_enabled_toggle,
                     "autonomous_settings.daily_summary.time": summary_time.strftime("%H:%M"),
@@ -1646,7 +1626,7 @@ def render_autonomous_tab():
                     st.rerun()
                 else:
                     st.error("Failed to save daily summary preferences.")
-
+        
         with task_col2:
             st.markdown("#### Auto-Archive")
             auto_archive_settings = autonomous_settings.get("auto_archive", {})
@@ -1657,7 +1637,7 @@ def render_autonomous_tab():
             archive_enabled_toggle = st.toggle(
                 "Enable Auto-Archive",
                 value=current_archive_enabled,
-                key="auto_archive_enable_toggle_auto_on",
+                key="auto_archive_enable_toggle_auto_tab", 
                 disabled=not st.session_state["autonomous_mode"]
             )
             archive_criteria = st.multiselect(
@@ -1665,7 +1645,7 @@ def render_autonomous_tab():
                 ["Low priority", "Promotions", "Notifications", "Social", "Older than 7 days", "Already responded"],
                 default=current_archive_criteria,
                 disabled=not st.session_state["autonomous_mode"] or not archive_enabled_toggle,
-                key="auto_archive_criteria_multiselect_auto_on"
+                key="auto_archive_criteria_multiselect_auto_tab"
             )
             archive_excluded_text = "\n".join(current_archive_excluded_senders)
             archive_excluded_input = st.text_area(
@@ -1673,11 +1653,11 @@ def render_autonomous_tab():
                 value=archive_excluded_text,
                 height=100,
                 disabled=not st.session_state["autonomous_mode"] or not archive_enabled_toggle,
-                key="auto_archive_excluded_textarea_auto_on"
+                key="auto_archive_excluded_textarea_auto_tab"
             )
-            if st.button("Save Auto-Archive Settings", key="save_auto_archive_button_auto_on", disabled=not st.session_state["autonomous_mode"]):
+            if st.button("Save Auto-Archive Settings", key="save_auto_archive_button_auto_tab", disabled=not st.session_state["autonomous_mode"]):
                 current_main_archive_permission = agent_prefs.get("allow_auto_archiving", False)
-                if not current_main_archive_permission: # Check the permission from agent_prefs
+                if not current_main_archive_permission:
                      st.error("To enable auto-archiving, please first check 'Allow automatic archiving...' under Autonomous Permissions.")
                 else:
                     excluded_list = [s.strip().lower() for s in archive_excluded_input.splitlines() if s.strip()]
@@ -1709,7 +1689,7 @@ def render_autonomous_tab():
             follow_up_enabled_toggle = st.toggle(
                 "Enable Follow-up Reminders",
                 value=current_follow_up_enabled,
-                key="follow_up_enable_toggle_auto_on",
+                key="follow_up_enable_toggle_auto_tab",
                 disabled=not st.session_state["autonomous_mode"]
             )
             remind_days = st.number_input(
@@ -1717,15 +1697,15 @@ def render_autonomous_tab():
                 min_value=1, max_value=14,
                 value=current_remind_days,
                 disabled=not st.session_state["autonomous_mode"] or not follow_up_enabled_toggle,
-                key="follow_up_remind_days_numberinput_auto_on"
+                key="follow_up_remind_days_numberinput_auto_tab"
             )
             priority_only = st.checkbox(
                 "Only for high priority emails",
                 value=current_priority_only,
                 disabled=not st.session_state["autonomous_mode"] or not follow_up_enabled_toggle,
-                key="follow_up_priority_only_checkbox_auto_on"
+                key="follow_up_priority_only_checkbox_auto_tab"
             )
-            if st.button("Save Follow-up Settings", key="save_follow_up_button_auto_on", disabled=not st.session_state["autonomous_mode"]):
+            if st.button("Save Follow-up Settings", key="save_follow_up_button_auto_tab", disabled=not st.session_state["autonomous_mode"]):
                 update_data = {
                     "autonomous_settings.follow_up.enabled": follow_up_enabled_toggle,
                     "autonomous_settings.follow_up.remind_days": remind_days,
@@ -1744,46 +1724,97 @@ def render_autonomous_tab():
                 else:
                     st.error("Failed to save follow-up system settings.")
 
+        # --- "Check Recent Autonomous Activity" BUTTON ---
+        st.markdown("---")
+        st.markdown("### Autonomous Activity Log")
+
+        # Placeholder for the activity report
+        activity_report_placeholder = st.empty()
+
+        if st.button("🔄 Check Recent Autonomous Activity", key="check_auton_activity_autonomous_tab"):
+            user_profile_data = memory.user_profile
+            last_summary = user_profile_data.get(
+                "last_autonomous_run_summary",
+                "No recent autonomous activity recorded by the backend."
+            )
+            last_timestamp = user_profile_data.get("last_autonomous_run_timestamp_utc")
+
+            activity_message = f"**Last Autonomous Run Summary:**\n\n{last_summary}"
+            if last_timestamp:
+                try:
+                    if isinstance(last_timestamp, datetime):
+                        ts_dt = last_timestamp.astimezone()
+                    else:
+                        ts_dt = datetime.fromisoformat(str(last_timestamp)).astimezone()
+                    activity_message += f"\n\n*(Last check: {ts_dt.strftime('%Y-%m-%d %H:%M:%S %Z')})*"
+                except ValueError:
+                    activity_message += f"\n\n*(Last check: {str(last_timestamp)})*"
+                except Exception as e_ts:
+                    logging.error(f"Error formatting autonomous activity timestamp: {e_ts}")
+                    activity_message += f"\n\n*(Last check: {str(last_timestamp)} - could not parse date)*"
+            
+            # Display the report directly in this tab
+            activity_report_placeholder.info(activity_message) # Use markdown=True if you want markdown in the message
+
+            # Also add to chat history for persistence
+            st.session_state[CHAT_HISTORY_KEY].append({
+                "role": "assistant",
+                "content": activity_message, # Send the formatted message
+                "context": {"hint": "autonomous_activity_report_displayed", "data": None}
+            })
+            # No st.rerun() needed here as st.info updates the placeholder directly.
+
 def process_pending_suggestion_actions():
     """Process any pending suggestion actions using the ProactiveAgent."""
-    rerun_needed = False # Flag if UI update is needed
+    rerun_needed = False
     action_processed_that_affects_suggestions = False # Flag
 
     if "suggested_action" in st.session_state and st.session_state.suggested_action:
         action_data = st.session_state.suggested_action
-        action_type = action_data.get('action') # Get action type
-        logging.info(f"Processing pending suggestion action: {action_type}")
+        action_type_from_data = action_data.get('action') # Get action type from the data
+        logging.info(f"Processing pending suggestion action: {action_type_from_data}")
 
-        # --- CORRECTED Unpacking ---
-        # Call the agent to process the action, expect 3 return values
+        # Call the agent to process the action
         response_text, was_handled, _ = proactive_agent.process_suggestion_action(action_data)
-        # Use underscore _ for the third value (download_data) as it's not used here yet
-        # --- END CORRECTION ---
 
         # Clear the suggestion state variable AFTER processing
         del st.session_state.suggested_action
 
-        # Add assistant response to chat history
         if response_text:
             st.session_state[CHAT_HISTORY_KEY].append({
                 "role": "assistant",
                 "content": response_text,
-                "context": {"hint": "action_result", "data": {"action": action_type, "handled": was_handled}}
+                "context": {"hint": "action_result", "data": {"action": action_type_from_data, "handled": was_handled}}
             })
-            rerun_needed = True
+            rerun_needed = True # A chat message was added, UI needs update
 
-        # Clear Suggestion Cache if Action Affects Generation
-        if was_handled and action_type in ["create_sender_rule", "create_domain_filter"]:
-            logging.info(f"Action '{action_type}' affects suggestions. Clearing suggestion cache.")
+        # --- Invalidate suggestion cache if the action could change suggestion relevance ---
+        # Define actions that typically change the context for suggestions
+        actions_affecting_suggestions = [
+            "create_sender_rule", "create_domain_filter", "cleanup_inbox",
+            "setup_daily_summary", "setup_follow_up",
+            # Add other actions if they modify user preferences or email states
+            # that suggestion generators depend on.
+        ]
+
+        if was_handled and action_type_from_data in actions_affecting_suggestions:
+            logging.info(f"Action '{action_type_from_data}' processed and affects suggestions. Clearing suggestion cache.")
             if SUGGESTIONS_STATE_KEY in st.session_state:
                 del st.session_state[SUGGESTIONS_STATE_KEY]
-            if LAST_DF_HASH_KEY in st.session_state:
+            if LAST_DF_HASH_KEY in st.session_state: # Also clear the hash to force regeneration
                 del st.session_state[LAST_DF_HASH_KEY]
+            action_processed_that_affects_suggestions = True
+            # The rerun_needed flag will already be true if a response_text was generated.
+            # If not, but cache was cleared, we still want to rerun.
+            if not rerun_needed:
+                rerun_needed = True
+
 
         if not was_handled:
-             logging.warning(f"Suggestion action '{action_type}' was not fully handled by the agent.")
-
-    return rerun_needed # Return flag to trigger st.rerun in the main UI loop if needed
+             logging.warning(f"Suggestion action '{action_type_from_data}' was not fully handled by the agent.")
+    
+    # No explicit st.rerun() here; let the main app loop handle it if rerun_needed is true.
+    return rerun_needed # Return flag
 
 # --- Function to process chat commands ---
 def generate_agent_response(user_query, memory_system=None, llm_client=None, config=None):
@@ -2527,7 +2558,7 @@ You can also give me feedback by correcting my priority assessments in the Email
               "need action" in query_lower or
               "require action" in query_lower or
               query_lower == "list emails requiring action"):
-            action_emails = fetch_emails_by_purpose("Action Request", 5) # Fetch DF
+            action_emails = fetch_emails_by_purpose("Action Request", limit=5, days_recent=30) # Fetch for last 30 days
 
             if not action_emails.empty:
                 response_text = f"I found {len(action_emails)} emails marked as Action Requests. Here are the most recent ones:\n\n---\n"
@@ -2887,7 +2918,12 @@ def render_suggestion_history_section():
 # --- Main Streamlit App Layout ---
 # Display agent header
 display_agent_header()
-
+rerun_after_action = process_pending_suggestion_actions()
+if rerun_after_action:
+    # If an action was processed and a chat message added,
+    # or if the suggestion cache was invalidated,
+    # rerun to update the UI immediately.
+    st.rerun()
 # Tabs for organization with improved design
 tabs = st.tabs(["💬 Chat & Dashboard", "✉️ Email Feedback", "📊 Insights", "⚙️ Settings", "🤖 Autonomous"])
 
@@ -3141,7 +3177,8 @@ with tabs[0]:
         # Rerun to update the displayed chat history smoothly
         st.rerun()
     
-
+    
+            
     # Render Dashboard below chat
     st.markdown("---") # Separator
     render_enhanced_dashboard()
@@ -3686,7 +3723,7 @@ with tabs[3]:
             "suggestion_cache_exists": SUGGESTIONS_STATE_KEY in st.session_state,
             "last_df_hash": st.session_state.get(LAST_DF_HASH_KEY, None)
         })
-    # --- YENİ EKLENEN DEBUG BÖLÜMÜ ---
+    
     st.markdown("### Debug Information")
     if st.checkbox("Show Session State Debug"):
         st.write("Dismissed Suggestions:", list(st.session_state.get("dismissed_suggestions", set())))
@@ -3694,7 +3731,7 @@ with tabs[3]:
             st.session_state.dismissed_suggestions = set()
             st.success("Dismissed state cleared!")
             st.rerun() # Sayfayı yenile
-    # --- YENİ DEBUG BÖLÜMÜNÜN SONU ---
+    
     render_suggestion_history_section()
 with tabs[4]:
     render_autonomous_tab()

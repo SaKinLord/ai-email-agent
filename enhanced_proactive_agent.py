@@ -9,9 +9,7 @@ Created on Sun Apr 28 14:21:44 2025
 
 import streamlit as st
 import pandas as pd
-# --- MODIFICATION: Add 'time' to the import ---
 from datetime import datetime, timedelta, time, timezone
-# --- END MODIFICATION ---
 import re
 import html
 from collections import Counter
@@ -26,6 +24,13 @@ from google.cloud import firestore,storage
 import database_utils
 import os
 
+# --- UI Color Constants (copied from ui_app.py for rendering within this agent) ---
+PRIMARY_COLOR = "#0078ff"
+ERROR_COLOR = "#ff4b4b"
+WARNING_COLOR = "#ff9900"
+MUTED_COLOR = "#6c757d"
+SUCCESS_COLOR = "#00c853" 
+ACCENT_COLOR = "#3da5f4"  
 
 # --- Define constants if not already globally available ---
 EMAILS_COLLECTION = "emails"
@@ -66,8 +71,8 @@ class ProactiveAgent:
         self.gmail_service = gmail_service
         self.suggestion_history = SuggestionHistory(db_client=db_client, user_id=user_id)
         self.suggestion_types = {
-            "sender_rule": self._generate_sender_rule_suggestion,
-            "domain_filter": self._generate_domain_filter_suggestion,
+            "sender_rule": self.generate_sender_rule_suggestion, 
+            "domain_filter": self.generate_domain_filter_suggestion,
             "pending_actions": self._generate_action_request_suggestion,
             "unanswered_questions": self._generate_question_suggestion,
             "high_priority": self._generate_high_priority_suggestion,
@@ -90,7 +95,7 @@ class ProactiveAgent:
 
         logging.info("ProactiveAgent initialized")
 
-    # ... (keep analyze_email_patterns, generate_proactive_suggestions, and other _generate_ methods as they are) ...
+    
     def analyze_email_patterns(self, email_df):
         """
         Analyze email patterns to generate insights and suggestions
@@ -270,126 +275,120 @@ class ProactiveAgent:
 
 
 
-    def _generate_sender_rule_suggestion(self, email_df, insights, user_preferences):
+    def generate_sender_rule_suggestion(self, email_df, insights, user_preferences):
         """Generate suggestion for creating a rule for a frequent sender"""
         if not insights or 'top_senders' not in insights or not insights['top_senders']:
             return None
-
-        # --- Get important senders from provided preferences or memory ---
-        important_senders = []
-        if user_preferences and "email_preferences" in user_preferences:
-             important_senders = user_preferences.get("email_preferences", {}).get("important_senders", [])
-        elif self.memory: # Fallback to fetching directly if needed (should be passed ideally)
-             prefs = self.memory.get_user_preferences()
-             important_senders = prefs.get("email_preferences", {}).get("important_senders", [])
-        # Ensure comparison is case-insensitive and handles different formats
-        important_senders_lower = {s.lower() for s in important_senders}
-        # --- End Get important senders ---
-
-        for sender_raw, count in insights['top_senders']:
-            # --- !! ADD CHECK: Is this sender already important? !! ---
-            sender_raw_lower = sender_raw.lower()
-            is_already_important = False
-            # Check if the raw string matches exactly or if any part matches an existing rule
-            if sender_raw_lower in important_senders_lower:
-                 is_already_important = True
-            else:
-                 # More robust check: see if sender_raw contains any important sender string
-                 for imp in important_senders_lower:
-                     if imp in sender_raw_lower:
-                         # Example: if "boss@company.com" is important, don't suggest for "Boss Name <boss@company.com>"
-                         is_already_important = True
-                         break
-            # --- !! END CHECK !! ---
-
-            # --- Add Cleaning/Escaping (keep this) ---
-            sender_display_name = sender_raw # Default
-            email_part = _extract_email_address(sender_raw)
-            name_match = re.match(r'^\s*"?([^"<]+)"?\s*<.*?>\s*$', sender_raw)
-            if name_match: sender_display_name = name_match.group(1).strip()
-            elif email_part and email_part != sender_raw:
-                 potential_name = sender_raw.split('<')[0].strip()
-                 if potential_name: sender_display_name = potential_name
-                 else: sender_display_name = email_part
-            elif email_part: sender_display_name = email_part
-            sender_display_safe = html.escape(sender_display_name)
-            # --- End Cleaning/Escaping ---
-
-            if count > 5 and not is_already_important:
-                description_text = f"You've received {count} emails from `{sender_display_safe}`. Want to set a priority rule?"
-                return {
-                    "type": "sender_rule",
-                    "title": f"Create rule for frequent sender",
-                    "description": description_text,
-                    "action": "create_sender_rule",
-                    "action_params": {"sender": sender_raw},
-                    "priority": "medium"  # Set explicit priority level
-                }
-
+        
+        if insights and 'top_senders' in insights and insights['top_senders']:
+            # --- Get important senders from provided preferences or memory ---
+            important_senders = []
+            if user_preferences and "email_preferences" in user_preferences:
+                 important_senders = user_preferences.get("email_preferences", {}).get("important_senders", [])
+            elif self.memory: # Fallback to fetching directly if needed (should be passed ideally)
+                 prefs = self.memory.get_user_preferences()
+                 important_senders = prefs.get("email_preferences", {}).get("important_senders", [])
+            # Ensure comparison is case-insensitive and handles different formats
+            important_senders_lower = {s.lower() for s in important_senders}
+            # --- End Get important senders ---
+            for sender_raw, count in insights['top_senders']:
+                # --- Add Cleaning/Escaping (keep this) ---
+                sender_display_name = sender_raw # Default
+                email_part = _extract_email_address(sender_raw)
+                name_match = re.match(r'^\s*"?([^"<]+)"?\s*<.*?>\s*$', sender_raw)
+                if name_match: sender_display_name = name_match.group(1).strip()
+                elif email_part and email_part != sender_raw:
+                     potential_name = sender_raw.split('<')[0].strip()
+                     if potential_name: sender_display_name = potential_name
+                     else: sender_display_name = email_part
+                elif email_part: sender_display_name = email_part
+                sender_display_safe = html.escape(sender_display_name)
+                # --- End Cleaning/Escaping ---
+                
+                # --- !! ADD CHECK: Is this sender already important? !! ---
+                sender_raw_lower = sender_raw.lower()
+                is_already_important = any(imp in sender_raw_lower for imp in important_senders_lower) or sender_raw_lower in important_senders_lower
+                # --- !! END CHECK !! ---
+                
+                if count > 5 and not is_already_important:
+                    description_text = f"You've received {count} emails from `{sender_display_safe}`. Want to set a priority rule?"
+                    rationale_text = (f"This sender ('{sender_display_safe}') has sent you {count} emails recently. "
+                                      f"Creating a rule can help automatically prioritize future communications from them. "
+                                      f"This sender is not currently in your important senders list.")
+                    return {
+                        "type": "sender_rule",
+                        "title": f"Create rule for {sender_display_safe}", # Ensure this specific title is used
+                        "description": description_text,
+                        "action": "create_sender_rule",
+                        "action_params": {"sender": sender_raw},
+                        "priority": "medium",
+                        "rationale": rationale_text
+                    }
         return None
 
-    def _generate_domain_filter_suggestion(self, email_df, insights, user_preferences):
+    def generate_domain_filter_suggestion(self, email_df, insights, user_preferences):
         """Generate suggestion for filtering emails from a domain"""
         if not insights or 'top_domains' not in insights:
             return None
-
-        # --- Get filtered domains from provided preferences or memory ---
-        filtered_domains = []
-        if user_preferences and "email_preferences" in user_preferences:
-            filtered_domains = user_preferences.get("email_preferences", {}).get("filtered_domains", [])
-        elif self.memory:
-            prefs = self.memory.get_user_preferences()
-            filtered_domains = prefs.get("email_preferences", {}).get("filtered_domains", [])
-        # Ensure comparison is case-insensitive
-        filtered_domains_lower = {d.lower() for d in filtered_domains}
-        # --- End Get filtered domains ---
-
-        for domain_raw, count in insights['top_domains']:
-            # Skip common providers
-            if domain_raw in ['gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com']:
-                continue
-
-            # --- !! ADD CHECK: Is this domain already filtered? !! ---
-            domain_raw_lower = domain_raw.lower()
-            domain_check_at = f"@{domain_raw_lower}" # Format with @
-            is_already_filtered = (domain_raw_lower in filtered_domains_lower or
-                                   domain_check_at in filtered_domains_lower)
-            # --- !! END CHECK !! ---
-
-            if count > 3 and not is_already_filtered:
-                domain_display_safe = html.escape(domain_raw)
-                description_text = f"You've received {count} emails from `{domain_display_safe}`. Would you like to add a filter?"
-                title_text = f"Filter {domain_display_safe} emails"
-                logging.info(f"Generating domain_filter suggestion for '{domain_raw}' (not already filtered).")
-                return {
-                    "type": "domain_filter",
-                    "title": title_text,
-                    "description": description_text,
-                    "action": "create_domain_filter",
-                    "action_params": {"domain": domain_raw},
-                    "priority": "medium"  # Set explicit priority level
-                }
-            elif is_already_filtered:
-                 logging.debug(f"Skipping domain_filter suggestion for '{domain_raw}' (already filtered).")
-
+        
+        if insights and 'top_domains' in insights and insights['top_domains']:
+            # --- Get filtered domains from provided preferences or memory ---
+            filtered_domains = []
+            if user_preferences and "email_preferences" in user_preferences:
+                filtered_domains = user_preferences.get("email_preferences", {}).get("filtered_domains", [])
+            elif self.memory:
+                prefs = self.memory.get_user_preferences()
+                filtered_domains = prefs.get("email_preferences", {}).get("filtered_domains", [])
+            # Ensure comparison is case-insensitive
+            filtered_domains_lower = {d.lower() for d in filtered_domains}
+            # --- End Get filtered domains ---
+            for domain_raw, count in insights['top_domains']:
+                # Skip common providers
+                if domain_raw in ['gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com']:
+                    continue
+                # --- !! ADD CHECK: Is this domain already filtered? !! ---
+                domain_raw_lower = domain_raw.lower()
+                domain_check_at = f"@{domain_raw_lower}" # Format with @
+                is_already_filtered = (domain_raw_lower in filtered_domains_lower or
+                                       domain_check_at in filtered_domains_lower)
+                # --- !! END CHECK !! ---
+                if count > 3 and not is_already_filtered:
+                    domain_display_safe = html.escape(domain_raw)
+                    description_text = f"You've received {count} emails from `{domain_display_safe}`. Would you like to add a filter?"
+                    title_text = f"Filter emails from @{domain_display_safe}"
+                    rationale_text = (f"The domain '@{domain_display_safe}' accounts for {count} of your recent emails. "
+                                    f"Filtering can help manage emails from this source, for example, by automatically labeling or archiving them. "
+                                    f"This domain is not currently in your filtered domains list.")
+                    logging.info(f"Generating domain_filter suggestion for '{domain_raw}' (not already filtered).")
+                    return {
+                        "type": "domain_filter",
+                        "title": title_text,
+                        "description": description_text,
+                        "action": "create_domain_filter",
+                        "action_params": {"domain": domain_raw},
+                        "priority": "medium",
+                        "rationale": rationale_text
+                    }
+                elif is_already_filtered:
+                     logging.debug(f"Skipping domain_filter suggestion for '{domain_raw}' (already filtered).")
         return None
 
     def _generate_action_request_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for handling action request emails"""
         if not insights or 'action_emails_count' not in insights:
             return None
-
         action_count = insights['action_emails_count']
         if action_count > 0:
+            rationale_text = (f"My analysis indicates {action_count} email(s) likely contain action requests or tasks. "
+                              f"Summarizing these can help you quickly identify what needs to be done.")
             return {
                 "type": "pending_actions",
-                "title": f"Pending action items",
-                "description": f"You have {action_count} emails requiring action. Want a summary?",
+                "title": f"Review {action_count} pending action item(s)", # More specific title
+                "description": f"You have {action_count} email(s) that seem to require action. Want a summary?",
                 "action": "summarize_action_items",
                 "action_params": {"count": action_count},
-                "priority": "high"  # Set explicit priority level
+                "priority": "high",
+                "rationale": rationale_text # ADDED RATIONALE
             }
-
         return None
 
 
@@ -430,251 +429,269 @@ class ProactiveAgent:
 
         st.success(f"Suggestion type '{suggestion_type.replace('_',' ').title()}' dismissed for this session.")
         # time.sleep(0.5) # Removed sleep
-        # Keep st.rerun() commented out
+        st.rerun() 
 
     def _generate_question_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for handling emails with questions"""
         if not insights or 'question_emails_count' not in insights:
             return None
-
         question_count = insights['question_emails_count']
         if question_count > 0:
+            rationale_text = (f"My analysis found {question_count} email(s) that likely contain direct questions. "
+                              f"Reviewing these can help ensure you address all inquiries.")
             return {
                 "type": "unanswered_questions",
-                "title": f"Unanswered questions",
-                "description": f"You have {question_count} emails with questions. Want to review them?",
+                "title": f"Review {question_count} email(s) with questions", # More specific
+                "description": f"You have {question_count} email(s) with questions. Want to review them?",
                 "action": "summarize_questions",
                 "action_params": {"count": question_count},
-                "priority": "high"  # Set explicit priority level
+                "priority": "high",
+                "rationale": rationale_text # ADDED RATIONALE
             }
-
         return None
 
     def _generate_high_priority_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for addressing high priority emails"""
         if not email_df.empty:
-            high_priority = email_df[email_df['Agent Priority'].isin(['CRITICAL', 'HIGH'])]
-            if not high_priority.empty and len(high_priority) > 0:
+            high_priority_df = email_df[email_df['Agent Priority'].isin(['CRITICAL', 'HIGH'])] # Renamed for clarity
+            count_high_priority = len(high_priority_df)
+            if count_high_priority > 0:
+                rationale_text = (f"There are {count_high_priority} email(s) classified as CRITICAL or HIGH priority. "
+                                  f"Reviewing summaries of these can help you address the most important items first.")
                 return {
                     "type": "high_priority",
-                    "title": f"High priority emails",
-                    "description": f"You have {len(high_priority)} high priority emails. Want me to summarize them?",
+                    "title": f"Summarize {count_high_priority} high priority email(s)", # More specific title
+                    "description": f"You have {count_high_priority} high priority emails. Want me to summarize them?",
                     "action": "summarize_high_priority",
-                    "action_params": {"count": len(high_priority)},
-                    "priority": "critical"  # Set explicit priority level
+                    "action_params": {"count": count_high_priority},
+                    "priority": "critical",
+                    "rationale": rationale_text # ADDED RATIONALE
                 }
         return None
 
     def _generate_time_management_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion to help with email time management"""
-        # Check if we have time distribution data
         if not insights or 'hour_distribution' not in insights:
             return None
-
         hour_distribution = insights.get('hour_distribution', {})
-        if not hour_distribution:
-            return None
-
-        # Find the peak hour(s)
+        if not hour_distribution: return None
         peak_hours = sorted(hour_distribution.items(), key=lambda x: x[1], reverse=True)[:2]
-        if not peak_hours:
-            return None
+        if not peak_hours: return None
 
-        # Make suggestion about best time to check emails
         peak_hour_1, count_1 = peak_hours[0]
-        time_range = f"{peak_hour_1}:00-{peak_hour_1+1}:00"
+        time_range_display = f"{peak_hour_1:02d}:00 - {peak_hour_1+1:02d}:00" # Ensure leading zero for hour
 
         if len(peak_hours) > 1:
             peak_hour_2, count_2 = peak_hours[1]
-            time_range = f"{peak_hour_1}:00-{peak_hour_1+1}:00 and {peak_hour_2}:00-{peak_hour_2+1}:00"
+            time_range_display = f"{peak_hour_1:02d}:00 - {peak_hour_1+1:02d}:00 and {peak_hour_2:02d}:00 - {peak_hour_2+1:02d}:00"
 
+        rationale_text = (f"Analysis of your email arrival times shows peak activity around {time_range_display}. "
+                          f"Scheduling dedicated blocks during or after these times can improve focus and efficiency.")
         return {
             "type": "time_management",
-            "title": "Email checking schedule",
-            "description": f"Most of your emails arrive between {time_range}. Want to schedule dedicated email checking times?",
+            "title": "Optimize Email Checking Schedule",
+            "description": f"Most of your emails arrive around {time_range_display}. Want to schedule dedicated email checking times?",
             "action": "schedule_email_time",
             "action_params": {"peak_hours": [h for h, _ in peak_hours]},
-            "priority": "medium" # Added priority
+            "priority": "medium",
+            "rationale": rationale_text # ADDED RATIONALE
         }
 
+
     def _generate_recurring_meeting_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for handling recurring meeting invites"""
         if not insights or 'meeting_emails_count' not in insights:
             return None
-
         meeting_count = insights.get('meeting_emails_count', 0)
-        if meeting_count > 2:
+        if meeting_count > 2: # Only suggest if there are several meeting invites
+            rationale_text = (f"You've received {meeting_count} meeting invitations recently. "
+                              f"I can help you list them, and if your calendar is connected, assist with scheduling or drafting responses.")
             return {
-                "type": "recurring_meeting",
-                "title": "Meeting management",
-                "description": f"You have {meeting_count} meeting invites. Would you like me to help organize your calendar?",
+                "type": "recurring_meeting", # Type name might be a bit misleading, more like "manage meeting invites"
+                "title": f"Manage {meeting_count} Meeting Invites",
+                "description": f"You have {meeting_count} meeting invites. Would you like me to help organize or respond to them?",
                 "action": "manage_meetings",
                 "action_params": {"count": meeting_count},
-                "priority": "medium" # Added priority
+                "priority": "medium",
+                "rationale": rationale_text # ADDED RATIONALE
             }
-
         return None
 
     def _generate_scheduled_send_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for scheduled sending of emails"""
-        # This is a generic suggestion not tied directly to insights
         hour = datetime.now().hour
-
-        # Only suggest during work hours
-        if 9 <= hour <= 17:
+        if 9 <= hour <= 17: # Only suggest during typical work hours
+            rationale_text = ("Sending emails at optimal times can increase their visibility and likelihood of a prompt response. "
+                              "This feature allows you to compose emails when convenient and have them sent later.")
             return {
                 "type": "scheduled_send",
-                "title": "Schedule email sending",
-                "description": "Would you like to draft emails now but schedule them to send at optimal times?",
-                "action": "scheduled_send_setup",
+                "title": "Consider Scheduled Email Sending",
+                "description": "Would you like to draft emails now but schedule them to send at optimal times (e.g., recipient's morning)?",
+                "action": "scheduled_send_setup", # This action would explain how to use the feature
                 "action_params": {},
-                "priority": "low" # Added priority
+                "priority": "low",
+                "rationale": rationale_text # ADDED RATIONALE
             }
-
         return None
 
     def _generate_email_cleanup_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for cleaning up emails"""
-        # Always available suggestion
         total_emails = len(email_df) if not email_df.empty else 0
+        rationale_text = "No specific rationale for general cleanup suggestion if no low-priority emails are found." # Default
 
         if total_emails > 10:
-            low_priority = email_df[email_df['Agent Priority'] == 'LOW'].shape[0] if not email_df.empty else 0
+            low_priority_count = email_df[email_df['Agent Priority'] == 'LOW'].shape[0] if not email_df.empty else 0
 
-            if low_priority > 0:
+            if low_priority_count > MAX_EMAILS_TO_ARCHIVE // 2 :
+                rationale_text = (f"You have {low_priority_count} emails classified as LOW priority. "
+                                  f"Archiving these can help declutter your inbox. I can queue up to {MAX_EMAILS_TO_ARCHIVE} for archiving.")
                 return {
                     "type": "email_cleanup",
-                    "title": "Inbox cleanup",
-                    "description": f"You have {low_priority} low priority emails. Want me to help you archive them?",
+                    "title": f"Archive {low_priority_count} low priority email(s)",
+                    "description": f"You have {low_priority_count} low priority emails. Want me to help you archive them?",
                     "action": "cleanup_inbox",
-                    "action_params": {"count": low_priority},
-                    "priority": "low"  # Set explicit priority level
+                    "action_params": {"count": low_priority_count, "max_to_archive": MAX_EMAILS_TO_ARCHIVE},
+                    "priority": "low",
+                    "rationale": rationale_text
                 }
-
-        # Fallback if no low priority emails found but total > 10
-        if total_emails > 10:
-            return {
-                "type": "email_cleanup", # Re-use type, but different action
-                "title": "Email organization",
-                "description": "Would you like me to suggest ways to better organize your inbox (e.g., filters, labels)?",
-                "action": "organize_inbox",
-                "action_params": {},
-                "priority": "low"  # Set explicit priority level
-            }
-
-        return None # Don't suggest if inbox is small
+            # Fallback if no low priority emails found but total > 10 (for "organize_inbox")
+            elif total_emails > 20: # Make this condition a bit stricter for general organization
+                rationale_text = (f"Your inbox has over {total_emails} processed emails. "
+                                  f"Exploring filters or labels could help manage this volume more effectively.")
+                return {
+                    "type": "email_cleanup", # Re-use type, but different action
+                    "title": "Explore Email Organization",
+                    "description": "Would you like me to suggest ways to better organize your inbox (e.g., filters for frequent senders, labels for projects)?",
+                    "action": "organize_inbox",
+                    "action_params": {},
+                    "priority": "low",
+                    "rationale": rationale_text # ADDED RATIONALE
+                }
+        return None
 
     def _generate_priority_summary_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for daily priority email summaries"""
-        # Check if already enabled in preferences
         daily_summary_enabled = False
         if self.memory:
             prefs = self.memory.get_user_preferences()
             daily_summary_enabled = prefs.get("agent_preferences", {}).get("daily_summary_enabled", False)
 
         if not daily_summary_enabled:
+            rationale_text = ("A daily summary can provide a quick overview of your most important emails at the start of your day, "
+                              "helping you prioritize tasks without needing to manually scan your entire inbox.")
             return {
                 "type": "priority_summary",
-                "title": "Daily summaries",
-                "description": "Would you like to receive a daily summary of your high priority emails?",
+                "title": "Enable Daily Priority Summaries",
+                "description": "Would you like to receive a daily summary of your high priority emails each morning?",
                 "action": "setup_daily_summary",
                 "action_params": {},
-                "priority": "low" # Added priority
+                "priority": "low",
+                "rationale": rationale_text # ADDED RATIONALE
             }
-        return None # Don't suggest if already enabled
-
-    def _generate_follow_up_suggestion(self, email_df, insights, user_preferences):
-        """Generate suggestion for following up on emails"""
-        # Look for action request emails that might need follow-up
-        if 'action_emails_count' in insights and insights['action_emails_count'] > 0:
-            return {
-                "type": "follow_up",
-                "title": "Follow-up assistance",
-                "description": "Would you like me to help you follow up on emails that haven't received responses?",
-                "action": "setup_follow_up",
-                "action_params": {},
-                "priority": "high" # Added priority
-            }
-
         return None
 
-    def render_suggestion_card(self, suggestion, key_prefix):
-        """
-        Render a single suggestion card with action buttons and enhanced styling
+    def _generate_follow_up_suggestion(self, email_df, insights, user_preferences):
+        # This suggestion is more about enabling a feature.
+        # The actual check for follow-ups happens when the action is processed or autonomously.
+        if not self.gmail_service: # Check if Gmail service is available
+            logging.debug("Follow-up suggestion skipped: Gmail service not available to ProactiveAgent.")
+            return None
 
-        Args:
-            suggestion: Dictionary with suggestion data
-            key_prefix: String prefix for unique Streamlit keys
-        """
-        # Use .get for safer dictionary access
+        # Check if follow-up feature is already configured/enabled by user
+        follow_up_enabled = self.memory.user_profile.get("autonomous_settings", {}).get("follow_up", {}).get("enabled", False)
+        if follow_up_enabled:
+            logging.debug("Follow-up suggestion skipped: Feature already enabled by user.")
+            return None
+
+        rationale_text = ("It's easy to lose track of emails awaiting replies. "
+                          "I can help by periodically checking your sent items and alerting you to messages that haven't received a response after a few days.")
+        return {
+            "type": "follow_up",
+            "title": "Enable Follow-up Reminders",
+            "description": "Would you like me to help you follow up on sent emails that haven't received responses?",
+            "action": "setup_follow_up", # This action will guide user or present current findings
+            "action_params": {},
+            "priority": "medium", # Changed from high, as it's more of a feature setup
+            "rationale": rationale_text
+        }
+
+    def render_suggestion_card(self, suggestion, key_prefix):
         title = suggestion.get('title', 'Suggestion')
         description = suggestion.get('description', '')
         suggestion_type = suggestion.get('type', 'unknown')
+        action_verb = suggestion.get('action', 'proceed')
+        rationale = suggestion.get('rationale', "No specific rationale provided for this suggestion.") # Get rationale
 
-        # Determine priority based on suggestion type or explicit priority field
-        # Default to medium if not specified
-        priority = suggestion.get('priority', self._get_default_priority(suggestion_type))
-
-        # Generate unique IDs for this card
-        card_id = f"card_{key_prefix}_{hash(suggestion_type)}"
-        yes_key = f"yes_{key_prefix}_{hash(str(suggestion.get('action', '')))}"
-        dismiss_key = f"dismiss_{key_prefix}_{hash(str(suggestion_type))}"
-
-        # Define color mapping based on priority
-        priority_colors = {
-            'critical': "#ff4b4b",  # Red for critical
-            'high': "#ff9900",      # Orange for high
-            'medium': "#0078ff",    # Blue (primary color) for medium
-            'low': "#6c757d"        # Gray for low
+        action_button_labels = {
+            "create_sender_rule": "Create Rule", "create_domain_filter": "Add Filter",
+            "summarize_action_items": "Summarize Actions", "summarize_questions": "Review Questions",
+            "summarize_high_priority": "Summarize Priority", "schedule_email_time": "Schedule Time",
+            "manage_meetings": "Organize Meetings", "scheduled_send_setup": "Setup Send Times",
+            "cleanup_inbox": "Archive Low Prio", "organize_inbox": "Suggest Organization",
+            "setup_daily_summary": "Enable Daily Summary", "setup_follow_up": "Setup Follow-ups"
         }
+        yes_button_text = f"✅ {action_button_labels.get(action_verb, 'Yes, proceed')}"
+        priority = suggestion.get('priority', self._get_default_priority(suggestion_type))
+        
+        # Unique keys
+        card_id = f"card_{key_prefix}_{suggestion_type}_{hash(title)}" # More specific key
+        yes_key = f"yes_{key_prefix}_{action_verb}_{hash(str(suggestion.get('action_params', {})))}"
+        dismiss_key = f"dismiss_{key_prefix}_{suggestion_type}_{hash(title)}"
+        popover_key = f"popover_{key_prefix}_{suggestion_type}_{hash(title)}"
 
-        # Get the appropriate color based on priority
-        border_color = priority_colors.get(priority, "#0078ff")
 
-        # Create the styled card with priority-based colors
-        st.markdown(f"""
-        <div id="{card_id}" class="suggestion-card priority-{priority}" style="
-            background-color: {border_color}15;
-            border-left: 5px solid {border_color};
-            border-radius: 10px;
-            padding: 1.25rem;
-            margin-bottom: 1.25rem;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
-            animation: fadeIn 0.5s;">
-            <h3 style="color: {border_color}; margin-top: 0; margin-bottom: 0.75rem; font-size: 1.25rem; font-weight: 600;">
-                <span style="
-                    display: inline-block;
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 50%;
-                    margin-right: 6px;
-                    background-color: {border_color};
-                "></span>
+        priority_colors = {
+            'critical': ERROR_COLOR, 'high': WARNING_COLOR, # Using constants from ui_app
+            'medium': PRIMARY_COLOR, 'low': MUTED_COLOR
+        }
+        border_color = priority_colors.get(priority, PRIMARY_COLOR)
+
+        # Card Header with Title and Info Popover
+        cols_header = st.columns([0.9, 0.1]) # Adjust ratio as needed
+        with cols_header[0]:
+            st.markdown(f"""
+            <h3 style="color: {border_color}; margin-top: 0; margin-bottom: 0.1rem; font-size: 1.20rem; font-weight: 600;">
+                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; background-color: {border_color}; vertical-align: middle;"></span>
                 {html.escape(title)}
             </h3>
+            """, unsafe_allow_html=True)
+        with cols_header[1]:
+            # Using st.popover for the rationale
+            with st.popover("Why?", help="Click to see why this suggestion is made.", use_container_width=False): # Temporarily removed key
+                st.markdown(f"**Rationale for '{html.escape(title)}':**")
+                st.markdown(html.escape(rationale))
+
+
+        # Card Body (Description)
+        st.markdown(f"""
+        <div id="{card_id}" class="suggestion-card priority-{priority}" style="
+            background-color: {border_color}1A; 
+            border-left: 5px solid {border_color}; 
+            border-radius: 10px; 
+            padding: 0.75rem 1.25rem 1.25rem 1.25rem; /* Adjusted padding */
+            margin-bottom: 1.25rem; 
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            animation: fadeIn 0.5s;
+            margin-top: -10px; /* Pulls it slightly under the header */
+            position: relative; /* For z-index if needed, though popover handles it */
+            z-index: 1; /* Ensure card content is below popover */
+            ">
             <p style="color: #e0e0e0; margin-bottom: 15px; line-height: 1.5; font-size: 0.95rem;">{html.escape(description)}</p>
         </div>
         """, unsafe_allow_html=True)
-
-        col1, col2 = st.columns([1, 1])
-        with col1:
+        
+        # Action Buttons (outside the styled div, but associated with the card)
+        col_actions_1, col_actions_2 = st.columns([1,1])
+        with col_actions_1:
             if st.button(
-                "✅ Yes, proceed",
-                key=yes_key,
+                yes_button_text, key=yes_key,
                 on_click=self.handle_suggestion_action,
-                args=(suggestion_type, suggestion.get('action'), suggestion.get('action_params', {}), True)
-
+                args=(suggestion_type, suggestion.get('action'), suggestion.get('action_params', {}), True),
+                use_container_width=True
             ):
                 pass
-
-        with col2:
+        with col_actions_2:
             if st.button(
-                "❌ Dismiss",
-                key=dismiss_key,
+                "❌ Dismiss", key=dismiss_key,
                 on_click=self.handle_dismiss_suggestion,
-                args=(suggestion_type,) # Keep this as is
+                args=(suggestion_type,),
+                use_container_width=True
             ):
                 pass
+        st.markdown("---") # Separator after each card
 
     def _get_default_priority(self, suggestion_type):
         """
@@ -779,36 +796,48 @@ class ProactiveAgent:
         # No recent dismissals found, ok to show
         return True
 
-    def get_suggestion_type_score(self, suggestion_type):
-        """Calculate a relevance score for a suggestion type based on history"""
-        type_history = self.suggestion_history.get_type_history(suggestion_type, limit=10)
+    def get_suggestion_type_score(self, suggestion_type, recency_days_tier1=7, recency_days_tier2=30):
+        """
+        Calculate a relevance score for a suggestion type based on history,
+        incorporating recency and overall acceptance rate.
+        """
+        if not self.suggestion_history:
+            return 0.5 # Neutral score if no history module
 
-        if not type_history:
-            return 0.5  # Neutral score for types with no history
+        # Get overall stats for this suggestion type
+        stats = self.suggestion_history.get_stats(days_back=90) # Analyze last 90 days for overall rate
+        type_specific_stats = stats.get('by_type', {}).get(suggestion_type, {})
+        
+        overall_shown = type_specific_stats.get('shown', 0)
+        overall_accepted = type_specific_stats.get('accepted', 0)
 
-        # Count acceptances and dismissals
-        shown = 0
-        accepted = 0
-
-        for record in type_history:
-            if record.get('was_shown', False):
-                shown += 1
-                if record.get('was_accepted') is True:
-                    accepted += 1
-
-        # Calculate acceptance rate
-        if shown > 0:
-            acceptance_rate = accepted / shown
+        if overall_shown > 0:
+            base_acceptance_rate = overall_accepted / overall_shown
         else:
-            acceptance_rate = 0.5  # Default for no data
+            base_acceptance_rate = 0.5  # Neutral score for types with no interaction history
 
-        # Apply recency weighting (more recent interactions matter more)
-        recency_weighted_score = acceptance_rate
+        # Recency weighting: Check recent interactions
+        recent_history = self.suggestion_history.get_type_history(suggestion_type, limit=10)
+        recency_boost = 0.0
+        
+        if recent_history:
+            # Simple recency: boost if last interaction was positive, penalize if negative
+            last_interaction = recent_history[0] # Most recent
+            if last_interaction.get('was_accepted') is True:
+                recency_boost = 0.15
+            elif last_interaction.get('was_accepted') is False:
+                recency_boost = -0.15
 
-        # Adjust score based on frequency (boost rare, high-value suggestions)
-        adjusted_score = recency_weighted_score
+            # More detailed recency: average acceptance in last N days
+            # (This part can be expanded if needed)
+            # For now, the simple boost/penalty on the last interaction is a good start.
 
-        return adjusted_score
+        # Combine base rate with recency boost
+        # Ensure score stays within 0-1 range
+        final_score = min(max(base_acceptance_rate + recency_boost, 0.0), 1.0)
+        
+        logging.debug(f"Score for '{suggestion_type}': BaseRate={base_acceptance_rate:.2f}, RecencyBoost={recency_boost:.2f}, FinalScore={final_score:.2f}")
+        return final_score
 
 
 

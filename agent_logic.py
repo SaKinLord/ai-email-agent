@@ -343,6 +343,27 @@ def parse_email_content(message):
     email_data['body_html'] = email_data['body_html'].strip()
     return email_data
 
+def _extract_email_address(sender_string: str) -> str | None:
+    """
+    Extracts the email address from a sender string.
+    Handles formats like "Display Name <email@example.com>" or just "email@example.com".
+    Returns the email address in lowercase or None if not found.
+    """
+    if not isinstance(sender_string, str):
+        return None
+    # Regex to find an email address pattern
+    match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', sender_string)
+    if match:
+        return match.group(0).lower()
+    # Fallback for cases where the string might just be an email without <>
+    # or if the regex fails for some unusual but valid sender strings.
+    # This is a basic fallback; more sophisticated parsing might be needed for edge cases.
+    cleaned_sender = sender_string.strip().lower()
+    if '@' in cleaned_sender and '.' in cleaned_sender.split('@')[-1]: # Basic check
+        return cleaned_sender
+    logging.debug(f"Could not extract a standard email address from: '{sender_string}'")
+    return None # Return None if no clear email address is found
+
 
 # --- NEW FUNCTION: get_context_for_analysis ---
 def get_context_for_analysis(llm_client, email_body, user_context=None, memory=None):
@@ -888,8 +909,7 @@ def suggest_email_actions(llm_client, email_data, analysis_result, config, memor
 
     # Get settings from config
     model_name = config['llm']['model_name']
-    # Use analysis tokens, maybe slightly more if needed, but keep reasonable
-    max_tokens = config['llm']['analysis_max_tokens']
+    max_tokens = config['llm'].get('action_suggestion_max_tokens', 250) # Use new config, default to 250 if not found
     temperature = 0.5  # Lower temperature for more predictable outputs
 
     # Prepare context
@@ -942,12 +962,12 @@ Suggest 1-3 appropriate actions as a JSON object with an "actions" array. Output
 
     # Make the call to the LLM
     try:
-        logging.info(f"Requesting action suggestions from Anthropic Claude ({model_name})...")
+        logging.info(f"Requesting action suggestions from Anthropic Claude ({model_name}). Max tokens: {max_tokens}") # Added max_tokens to log
         message = llm_client.messages.create(
             model=model_name,
             system=system_prompt,
             messages=[{"role": "user", "content": [{"type": "text", "text": user_prompt}]}],
-            max_tokens=max_tokens,
+            max_tokens=max_tokens, # This will now use the updated value
             temperature=temperature
         )
 

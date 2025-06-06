@@ -13,13 +13,16 @@ import sys
 import logging
 import json
 import time
+from datetime import timedelta
 from datetime import datetime, timezone
 import tempfile # Added for GCF model loading
 import functions_framework
+import base64
 
 # --- Third-party Imports ---
 import pandas as pd
 import joblib
+from google.cloud.firestore_v1.base_query import FieldFilter
 from googleapiclient.errors import HttpError # Import HttpError
 from google.cloud import firestore
 from google.cloud import storage
@@ -33,8 +36,14 @@ from agent_logic import (
     load_config, authenticate_gmail, get_unread_email_ids,
     get_email_details, parse_email_content,
     process_email_with_memory,
-    PRIORITY_CRITICAL, PRIORITY_HIGH # Keep constants if needed elsewhere
+    PRIORITY_CRITICAL, PRIORITY_HIGH, 
+    prepare_email_batch_overview, 
+    list_sent_emails,             
+    check_thread_for_reply,       
+    _extract_email_address,
+    analyze_email_with_context        
 )
+
 # Import database functions needed here
 from database_utils import (
     is_email_processed, add_processed_email,
@@ -53,6 +62,7 @@ from ml_utils import (
 )
 
 from agent_memory import AgentMemory
+from email.mime.text import MIMEText
 
 # --- Logging Setup ---
 log_format = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
@@ -78,6 +88,13 @@ ANTHROPIC_SECRET_NAME = os.environ.get('ANTHROPIC_SECRET_NAME')
 # --- NEW Env Vars for ML Models ---
 MODEL_GCS_BUCKET = os.environ.get('MODEL_GCS_BUCKET') # Separate or same bucket for models
 MODEL_GCS_PATH_PREFIX = os.environ.get('MODEL_GCS_PATH_PREFIX', 'ml_models/') # e.g., 'ml_models/'
+
+# --- NEW: Constants for Autonomous Tasks ---
+DAILY_SUMMARY_ACTION_TYPE = "send_daily_summary_email"
+AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES = 60
+DAILY_SUMMARY_CHECK_INTERVAL_MINUTES = 60
+FOLLOW_UP_CHECK_INTERVAL_MINUTES = 60
+RE_EVAL_UNKNOWN_INTERVAL_MINUTES = 1440 # Once a day (24 * 60)
 
 # === Helper Functions for GCS State/Token ===
 # (Keep read_json_from_gcs, write_json_to_gcs, read_retrain_state_from_gcs, write_retrain_state_to_gcs as before)
@@ -170,6 +187,410 @@ def get_secret(secret_version_name):
         logging.error(f"Failed to access secret {secret_version_name}: {e}", exc_info=True)
         return None
 
+# --- NEW: Helper to check if task should run based on interval ---
+def should_run_task(task_name, interval_minutes, memory_instance):
+    """Checks if a task should run based on its last run time stored in user profile."""
+    now = datetime.now(timezone.utc)
+    task_last_run_key = f"autonomous_tasks.{task_name}.last_run_utc"
+    last_run_iso = memory_instance.user_profile.get("autonomous_tasks", {}).get(task_name, {}).get("last_run_utc")
+
+    if last_run_iso:
+        try:
+            last_run_dt = datetime.fromisoformat(last_run_iso)
+            if (now - last_run_dt) < timedelta(minutes=interval_minutes):
+                logging.info(f"Task '{task_name}' ran recently ({last_run_dt.isoformat()}). Skipping.")
+                return False
+        except ValueError:
+            logging.warning(f"Could not parse last_run_iso for task '{task_name}': {last_run_iso}")
+    
+    logging.info(f"Task '{task_name}' is due to run.")
+    return True
+
+def update_task_last_run(task_name, memory_instance):
+    """Updates the last run time for a task in user profile."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_path = f"autonomous_tasks.{task_name}.last_run_utc"
+    memory_instance.save_profile_updates({update_path: now_iso})
+    logging.info(f"Updated last_run_utc for task '{task_name}' to {now_iso}")
+
+def get_or_create_label_ids(gmail_service, label_names_to_ensure):
+    """
+    Ensures labels exist in Gmail, creates them if not.
+    Returns a list of label IDs corresponding to the input names.
+    """
+    if not gmail_service or not label_names_to_ensure:
+        return []
+
+    existing_labels_map = {}
+    try:
+        results = gmail_service.users().labels().list(userId='me').execute()
+        labels = results.get('labels', [])
+        for label in labels:
+            existing_labels_map[label['name']] = label['id']
+    except Exception as e:
+        logging.error(f"Could not list existing Gmail labels: {e}", exc_info=True)
+        return [] # Return empty on error, so we don't try to apply non-existent labels
+
+    label_ids_to_apply = []
+    for label_name in label_names_to_ensure:
+        if label_name in existing_labels_map:
+            label_ids_to_apply.append(existing_labels_map[label_name])
+        else:
+            # Label does not exist, create it
+            logging.info(f"Label '{label_name}' not found. Attempting to create it.")
+            label_body = {
+                'name': label_name,
+                'labelListVisibility': 'labelShow',    # Or 'labelHide'
+                'messageListVisibility': 'show'        # Or 'hide'
+            }
+            # Handle nested labels: Gmail API creates parent labels automatically if they don't exist
+            # when you provide a path-like name (e.g., "Maia/Priority/Medium")
+            try:
+                created_label = gmail_service.users().labels().create(userId='me', body=label_body).execute()
+                logging.info(f"Successfully created label '{label_name}' with ID '{created_label['id']}'.")
+                label_ids_to_apply.append(created_label['id'])
+                existing_labels_map[label_name] = created_label['id'] # Add to map for this session
+            except HttpError as e_create:
+                logging.error(f"HttpError creating label '{label_name}': {e_create}", exc_info=True)
+                # If creation fails, we can't apply it. Optionally, retry or just skip.
+            except Exception as e_create_unexpected:
+                logging.error(f"Unexpected error creating label '{label_name}': {e_create_unexpected}", exc_info=True)
+    
+    return label_ids_to_apply
+
+# --- NEW: Orchestration function for autonomous tasks ---
+def execute_autonomous_tasks(user_id, memory_instance, gmail_service, llm_client, config, db_client):
+    logging.info(f"--- Executing Autonomous Tasks for user {user_id} ---")
+
+    # 1) Verify that memory and user_profile exist
+    if not memory_instance or not memory_instance.user_profile:
+        logging.error(f"Cannot execute autonomous tasks: Memory or user profile not available for {user_id}.")
+        return
+
+    profile = memory_instance.user_profile
+
+    # +++ DEBUG: Serialize and log the entire profile object +++
+    try:
+        profile_serializable = json.loads(json.dumps(profile, default=str))
+        logging.info(f"GCF DEBUG: Full user_profile loaded for {user_id}: {json.dumps(profile_serializable, indent=2)}")
+    except Exception as e_dump:
+        logging.error(f"GCF DEBUG: Could not serialize and dump full profile: {e_dump}")
+        logging.info(f"GCF DEBUG: Raw profile object (might be complex): {profile}")
+
+    agent_prefs = profile.get("agent_preferences", {})
+    logging.info(f"GCF DEBUG: Extracted agent_prefs: {json.dumps(agent_prefs, indent=2)}")
+    autonomous_settings = profile.get("autonomous_settings", {})
+
+    # We’ll use this flag to know if autonomous mode was truly enabled for this run
+    autonomous_mode_run = False
+
+    is_auton_enabled_in_gcf = agent_prefs.get("autonomous_mode_enabled", False)
+    logging.info(f"GCF DEBUG: Value of 'autonomous_mode_enabled' from loaded agent_prefs: {is_auton_enabled_in_gcf}")
+
+    if not is_auton_enabled_in_gcf:
+        logging.info(f"Autonomous mode disabled for user {user_id}. Skipping tasks.")
+        return
+    else:
+        # If autonomous_mode_enabled is true, mark it so we can generate a summary at the end
+        autonomous_mode_run = True
+
+    # --- 1. Auto-Archiving ---
+    archived_count = 0  # Will track how many emails we queued for archiving
+    if agent_prefs.get("allow_auto_archiving", False) and \
+       autonomous_settings.get("auto_archive", {}).get("enabled", False) and \
+       should_run_task("auto_archive", AUTO_ARCHIVE_CHECK_INTERVAL_MINUTES, memory_instance):
+
+        logging.info(f"Running Auto-Archive task for user {user_id}...")
+        archive_settings = autonomous_settings.get("auto_archive", {})
+        excluded_senders = {s.lower() for s in archive_settings.get("excluded_senders", [])}
+
+        # Find emails older than N days (default 7) with low priority or “Promotion” purpose
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=archive_settings.get("archive_after_days", 7))
+
+        base_query = db_client.collection(EMAILS_COLLECTION).where(filter=FieldFilter("user_id", "==", user_id))
+        q_low_prio = base_query.where(filter=FieldFilter("priority", "==", "LOW")) \
+                       .where(filter=FieldFilter("processed_timestamp", "<", cutoff_date)) \
+                       .limit(50)
+        q_promo = base_query.where(filter=FieldFilter("llm_purpose", "==", "Promotion")) \
+                      .where(filter=FieldFilter("processed_timestamp", "<", cutoff_date)) \
+                      .limit(50)
+
+        email_ids_to_check = set()
+        try:
+            for doc in q_low_prio.stream():
+                email_ids_to_check.add(doc.id)
+            for doc in q_promo.stream():
+                email_ids_to_check.add(doc.id)
+            # You could add more queries here for other criteria (e.g., “Notifications”)
+        except Exception as e:
+            logging.error(f"Error querying emails for auto-archiving: {e}", exc_info=True)
+
+        # Process up to 20 IDs in this run
+        for email_id in list(email_ids_to_check)[:20]:
+            try:
+                email_doc = db_client.collection(EMAILS_COLLECTION).document(email_id).get()
+                if not email_doc.exists:
+                    continue
+
+                email_data = email_doc.to_dict()
+                sender = email_data.get("sender", "").lower()
+                sender_email_part = _extract_email_address(sender)
+
+                # Skip excluded senders or domains
+                if sender_email_part and sender_email_part in excluded_senders:
+                    continue
+                if any(excl in sender for excl in excluded_senders if excl.startswith('@')):
+                    continue
+
+                # Request “archive” action in Firestore; if that succeeds, increment counter
+                if database_utils.request_email_action(email_id, "archive"):
+                    archived_count += 1
+            except Exception as e_arc:
+                logging.error(f"Error processing email {email_id} for auto-archive: {e_arc}", exc_info=True)
+
+        logging.info(f"Auto-Archive: Queued {archived_count} emails for archiving for user {user_id}.")
+        # Update last run timestamp even if count is zero
+        update_task_last_run("auto_archive", memory_instance)
+
+    # --- 2. Daily Summary ---
+    daily_summary_queued = False  # Will track whether we queued a daily summary email
+    if autonomous_settings.get("daily_summary", {}).get("enabled", False) and \
+       should_run_task("daily_summary", DAILY_SUMMARY_CHECK_INTERVAL_MINUTES, memory_instance):
+
+        summary_settings = autonomous_settings.get("daily_summary", {})
+        summary_time_str = summary_settings.get("time", "08:00")  # e.g. “08:00”
+        summary_content_prefs = summary_settings.get("content", ["High priority emails"])
+
+        # Because Cloud Functions run in UTC, compare against UTC hour.
+        now_utc = datetime.now(timezone.utc)
+        try:
+            summary_hour, summary_minute = map(int, summary_time_str.split(':'))
+            if now_utc.hour == summary_hour:
+                logging.info(f"Running Daily Summary task for user {user_id}...")
+
+                emails_for_summary_df = pd.DataFrame()
+
+                if "High priority emails" in summary_content_prefs:
+                    cutoff_24h = datetime.now(timezone.utc) - timedelta(days=1)
+                    query_hp = db_client.collection(EMAILS_COLLECTION) \
+                        .where(filter=FieldFilter("user_id", "==", user_id)) \
+                        .where(filter=FieldFilter("priority", "in", [PRIORITY_CRITICAL, PRIORITY_HIGH])) \
+                        .where(filter=FieldFilter("processed_timestamp", ">=", cutoff_24h)) \
+                        .order_by("processed_timestamp", direction=firestore.Query.DESCENDING) \
+                        .limit(10)
+
+                    summary_emails_list = [doc.to_dict() for doc in query_hp.stream()]
+                    if summary_emails_list:
+                        emails_for_summary_df = pd.DataFrame(summary_emails_list)
+
+                if not emails_for_summary_df.empty:
+                    summary_text = prepare_email_batch_overview(
+                        llm_client,
+                        emails_for_summary_df.to_dict(orient='records'),
+                        config,
+                        memory_instance
+                    )
+                    user_email = profile.get("email")
+
+                    # Fallback: If profile did not contain an email, fetch via Gmail API
+                    if not user_email and gmail_service:
+                        try:
+                            user_profile_gmail = gmail_service.users().getProfile(userId='me').execute()
+                            user_email = user_profile_gmail.get('emailAddress')
+                        except Exception as e_get_email:
+                            logging.error(f"Could not get user's email for daily summary: {e_get_email}", exc_info=True)
+
+                    if user_email and summary_text and not summary_text.startswith("Error:"):
+                        email_subject = f"Maia Daily Email Summary - {datetime.now().strftime('%Y-%m-%d')}"
+                        action_params = {
+                            "to": user_email,
+                            "subject": email_subject,
+                            "body": summary_text,
+                            "is_html": False
+                        }
+                        if database_utils.request_email_action(email_id=None, action_type="send_draft", params=action_params):
+                            logging.info(f"Daily summary queued for sending to {user_email}.")
+                            daily_summary_queued = True
+                            update_task_last_run("daily_summary", memory_instance)
+                        else:
+                            logging.error(f"Failed to queue daily summary for user {user_id}.")
+                    elif not user_email:
+                        logging.error(f"Cannot send daily summary for {user_id}: User email not found in profile.")
+                    else:
+                        logging.warning(f"Daily summary generation failed or the summary text was empty for user {user_id}.")
+                else:
+                    logging.info(f"No relevant emails found for daily summary for user {user_id}.")
+                    update_task_last_run("daily_summary", memory_instance)
+            else:
+                logging.debug(f"Not time for daily summary for {user_id}. Current UTC hour: {now_utc.hour}, Configured: {summary_hour}")
+        except ValueError:
+            logging.error(f"Invalid time format for daily_summary for user {user_id}: {summary_time_str}", exc_info=True)
+        except Exception as e_sum:
+            logging.error(f"Error during daily summary task for {user_id}: {e_sum}", exc_info=True)
+
+    # --- 3. Follow-up Reminders ---
+    found_follow_ups = 0  # Will count how many new follow-up tasks we created
+    if autonomous_settings.get("follow_up", {}).get("enabled", False) and \
+       should_run_task("follow_up_check", FOLLOW_UP_CHECK_INTERVAL_MINUTES, memory_instance):
+
+        logging.info(f"Running Follow-up Reminder task for user {user_id}...")
+        follow_up_settings = autonomous_settings.get("follow_up", {})
+        remind_days = follow_up_settings.get("remind_days", 3)
+        priority_only = follow_up_settings.get("priority_only", True)
+
+        if not gmail_service:
+            logging.warning(f"Cannot check follow-ups for {user_id}: Gmail service not available in GCF context.")
+        else:
+            try:
+                sent_messages = list_sent_emails(
+                    gmail_service,
+                    days_ago=remind_days + 15,
+                    max_results=50
+                )
+
+                for message_info in sent_messages:
+                    thread_id = message_info.get('threadId')
+                    message_id = message_info.get('id')
+                    if not thread_id or not message_id:
+                        continue
+
+                    task_exists_query = db_client.collection("user_tasks") \
+                                     .where(filter=firestore.FieldFilter("user_id", "==", user_id)) \
+                                     .where(filter=firestore.FieldFilter("task_type", "==", "follow_up_needed")) \
+                                     .where(filter=firestore.FieldFilter("related_email_id", "==", message_id)) \
+                                     .limit(1).stream()
+                    if next(task_exists_query, None):
+                        logging.debug(f"Follow-up task already exists for sent email {message_id}. Skipping.")
+                        continue
+
+                    has_reply = check_thread_for_reply(gmail_service, thread_id, message_id)
+                    if not has_reply:
+                        msg_details = get_email_details(gmail_service, message_id)
+                        if msg_details:
+                            parsed_sent_email = parse_email_content(msg_details)
+                            sent_date_str = parsed_sent_email.get('date')
+                            sent_dt = None
+                            try:
+                                from dateutil import parser
+                                sent_dt = parser.parse(sent_date_str)
+                                if sent_dt.tzinfo is None:
+                                    sent_dt = sent_dt.replace(tzinfo=timezone.utc)
+                            except Exception:
+                                pass
+
+                            if sent_dt and (datetime.now(timezone.utc) - sent_dt).days >= remind_days:
+                                # If priority_only is True, you could check an original email priority here.
+                                # For now, we create a follow-up task regardless.
+                                recipient = next(
+                                    (h['value'] for h in msg_details['payload']['headers'] if h['name'].lower() == 'to'),
+                                    '[No Recipient]'
+                                )
+                                task_data = {
+                                    "user_id": user_id,
+                                    "task_type": "follow_up_needed",
+                                    "related_email_id": message_id,
+                                    "subject": parsed_sent_email.get('subject', '[No Subject]'),
+                                    "recipient": recipient,
+                                    "sent_date": sent_dt,
+                                    "status": "pending",
+                                    "created_at": firestore.SERVER_TIMESTAMP
+                                }
+                                db_client.collection("user_tasks").add(task_data)
+                                found_follow_ups += 1
+                                logging.info(f"Created follow-up task for sent email {message_id} to {recipient}.")
+                                if found_follow_ups >= 5:
+                                    break
+            except Exception as e_fup:
+                logging.error(f"Error during follow-up check for {user_id}: {e_fup}", exc_info=True)
+
+        logging.info(f"Follow-up Check: Created {found_follow_ups} new follow-up tasks for user {user_id}.")
+        update_task_last_run("follow_up_check", memory_instance)
+
+    # --- 4. Auto-Categorization/Priority Labels ---
+    # (Handled inside the main email processing loop, so not repeated here.)
+
+    # --- 5. Re-evaluate Unknown Email Purposes ---
+    reclassified_count = 0  # Will count how many “Unknown” emails got reclassified
+    RE_EVAL_UNKNOWN_INTERVAL_MINUTES = 1440
+    if agent_prefs.get("allow_auto_reclassification", False) and \
+       should_run_task("re_evaluate_unknowns", RE_EVAL_UNKNOWN_INTERVAL_MINUTES, memory_instance):
+
+        logging.info(f"Running Re-evaluate Unknown Purposes task for user {user_id}...")
+        try:
+            unknown_emails_query = db_client.collection(EMAILS_COLLECTION) \
+                .where(filter=FieldFilter("user_id", "==", user_id)) \
+                .where(filter=FieldFilter("llm_purpose", "==", "Unknown")) \
+                .limit(20)
+
+
+            for doc_snapshot in unknown_emails_query.stream():
+                email_id = doc_snapshot.id
+                email_data = doc_snapshot.to_dict()
+                email_data['id'] = email_id
+
+                logging.debug(f"Re-evaluating email {email_id} with unknown purpose.")
+                new_analysis = analyze_email_with_context(llm_client, email_data, config, memory_instance)
+
+                if new_analysis and new_analysis.get("purpose") and new_analysis.get("purpose") != "Unknown":
+                    update_fields = {
+                        "llm_purpose": new_analysis.get("purpose"),
+                        "llm_urgency": new_analysis.get("urgency_score"),
+                        "response_needed": new_analysis.get("response_needed"),
+                        "estimated_time": new_analysis.get("estimated_time"),
+                        "last_reclassified_utc": firestore.SERVER_TIMESTAMP
+                    }
+                    db_client.collection(EMAILS_COLLECTION).document(email_id).update(update_fields)
+                    reclassified_count += 1
+                    logging.info(f"Re-classified email {email_id} to purpose: {new_analysis.get('purpose')}")
+                else:
+                    logging.debug(f"Could not re-classify email {email_id}; LLM still returned Unknown or failed.")
+
+            logging.info(f"Re-evaluate Unknowns: Re-classified {reclassified_count} emails for user {user_id}.")
+            update_task_last_run("re_evaluate_unknowns", memory_instance)
+        except Exception as e_reval:
+            logging.error(f"Error during re-evaluation of unknown purposes for {user_id}: {e_reval}", exc_info=True)
+
+    # --- FINAL SUMMARY: Which autonomous actions ran this GCF execution? ---
+    if autonomous_mode_run:
+        actions_taken_summary = []
+
+        if archived_count > 0:
+            actions_taken_summary.append(f"Auto-Archive: Queued {archived_count} emails.")
+        if daily_summary_queued:
+            actions_taken_summary.append("Daily Summary: Queued for sending.")
+        if found_follow_ups > 0:
+            actions_taken_summary.append(f"Follow-up Check: Created {found_follow_ups} new tasks.")
+        if reclassified_count > 0:
+            actions_taken_summary.append(f"Re-evaluate Unknowns: Re-classified {reclassified_count} emails.")
+
+        if actions_taken_summary:
+            summary_message = (
+                f"Autonomous actions for user {user_id} this run: "
+                + "; ".join(actions_taken_summary)
+            )
+            logging.info(summary_message)
+
+            # Optionally save this summary back into the user's profile in Firestore
+            try:
+                memory_instance.save_profile_updates({
+                    "last_autonomous_run_summary": summary_message,
+                    "last_autonomous_run_timestamp_utc": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as e_save:
+                logging.error(f"Could not save last autonomous run summary to memory: {e_save}", exc_info=True)
+        else:
+            no_action_msg = "No specific autonomous actions taken in this run."
+            logging.info(f"Autonomous mode was enabled for user {user_id}, but {no_action_msg}")
+            try:
+                memory_instance.save_profile_updates({
+                    "last_autonomous_run_summary": no_action_msg,
+                    "last_autonomous_run_timestamp_utc": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as e_save2:
+                logging.error(f"Could not save no-action summary to memory: {e_save2}", exc_info=True)
+
+    logging.info(f"--- Finished Autonomous Tasks for user {user_id} ---")
+    
 # === *** IMPLEMENTATION of Training Data Fetching *** ===
 def fetch_and_prepare_training_data(db_client):
     """
@@ -370,31 +791,29 @@ def process_action_requests(gmail_service):
     if not gmail_service:
         logging.error("Gmail service not available, cannot process action requests.")
         return 0
-
     processed_count = 0
     logging.info("--- Checking for pending action requests ---")
     try:
-        query = database_utils.db.collection(ACTION_REQUESTS_COLLECTION)\
-                  .where('status', '==', 'pending')\
-                  .limit(10)
+        query = (database_utils.db.collection(ACTION_REQUESTS_COLLECTION)
+                 .where(filter=FieldFilter('status', '==', 'pending'))
+                 .limit(10))
         results = query.stream()
-
         for doc in results:
             request_id = doc.id
             request_data = doc.to_dict()
-            email_id = request_data.get('email_id') # Original email ID (might be None)
+            email_id = request_data.get('email_id')
             action = request_data.get('action')
-            params = request_data.get('params', {}) # Get the params dictionary
+            params = request_data.get('params', {})
             logging.info(f"Processing action '{action}' (Request ID: {request_id}, Orig Email ID: {email_id})")
-
-            # Allow actions without email_id like 'send_draft' if params are sufficient
+            
             if not action:
                 logging.warning(f"Skipping invalid action request {request_id}: Missing action.")
                 update_action_request_status(request_id, "failed", "Missing action in request.")
                 continue
-
+            
             success = False
             error_message = ""
+            
             try:
                 if action == "archive":
                     if not email_id:
@@ -406,27 +825,68 @@ def process_action_requests(gmail_service):
                         logging.info(f"Successfully archived email {email_id}.")
                         success = True
                 
+                elif action == "send_draft":
+                    to_recipient = params.get("to")
+                    subject = params.get("subject")
+                    body = params.get("body")
+                    is_html = params.get("is_html", False) 
+
+                    if not to_recipient or not subject or not body:
+                        error_message = "Missing 'to', 'subject', or 'body' in params for send_draft."
+                        logging.warning(f"Cannot send draft for request {request_id}: {error_message}")
+                    else:
+                        message = MIMEText(body, 'html' if is_html else 'plain')
+                        message['to'] = to_recipient
+                        message['subject'] = subject
+                        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+                        send_body = {'raw': raw_message}
+                        gmail_service.users().messages().send(userId='me', body=send_body).execute()
+                        logging.info(f"Successfully sent email draft (Request ID: {request_id}) to {to_recipient}.")
+                        success = True
+                
+                elif action == "apply_label":
+                    label_names_from_params = params.get("labels_to_add", []) # These are names like "Maia/Priority/Medium"
+                    if not email_id:
+                        error_message = "Missing email_id for apply_label action."
+                        logging.warning(f"Cannot apply label for request {request_id}: {error_message}")
+                    elif not label_names_from_params or not isinstance(label_names_from_params, list):
+                        error_message = "Missing or invalid 'labels_to_add' (names) in params for apply_label."
+                        logging.warning(f"Cannot apply label for request {request_id}: {error_message}")
+                    else:
+                        actual_label_ids_to_apply = get_or_create_label_ids(gmail_service, label_names_from_params)
+                        
+                        if actual_label_ids_to_apply: # Check if we got any valid IDs back
+                            modify_body = {'addLabelIds': actual_label_ids_to_apply}
+                            gmail_service.users().messages().modify(userId='me', id=email_id, body=modify_body).execute()
+                            logging.info(f"Successfully applied/ensured labels (IDs: {actual_label_ids_to_apply}) to email {email_id} for names {label_names_from_params}.")
+                            success = True
+                        elif label_names_from_params: # Had names, but couldn't get/create IDs
+                            error_message = f"Failed to get or create one or more specified labels: {label_names_from_params}."
+                            logging.error(f"For request {request_id}, email {email_id}: {error_message}")
+                        else: # No label names were provided in the first place (already caught, but defensive)
+                            error_message = "No label names provided to apply."
+                            logging.warning(f"For request {request_id}, email {email_id}: {error_message}")
+                
                 else:
                     logging.warning(f"Unsupported action '{action}' requested (Request ID: {request_id}).")
                     error_message = f"Unsupported action type: {action}"
-
+            
             except HttpError as error:
                 logging.error(f"HttpError performing action '{action}' (Request ID: {request_id}): {error}", exc_info=True)
                 error_message = f"API Error: {error.resp.status} - {error.content.decode()}"
             except Exception as e:
                 logging.error(f"Unexpected error performing action '{action}' (Request ID: {request_id}): {e}", exc_info=True)
                 error_message = f"Unexpected Error: {type(e).__name__}"
-
-            # Update status in Firestore
+            
             update_action_request_status(request_id, "completed" if success else "failed", error_message)
             processed_count += 1
-
+            
         logging.info(f"--- Finished processing action requests. Processed {processed_count} requests this run. ---")
         return processed_count
-
     except Exception as e:
         logging.error(f"Error querying action requests: {e}", exc_info=True)
         return 0
+
 
 # === Main GCF Handler ===
 @functions_framework.http
@@ -636,9 +1096,30 @@ def process_emails_gcf(request):
         if not gmail_service:
             raise RuntimeError("Gmail authentication failed.")
         logging.info("Gmail authentication successful.")
+        
         # --- *** PROCESS ACTION REQUESTS (Before processing new emails) *** ---
         process_action_requests(gmail_service)
         # --- *** END PROCESS ACTION REQUESTS *** ---
+        
+        # --- *** NEW: EXECUTE AUTONOMOUS TASKS *** ---
+        if memory_instance and gmail_service and llm_client_gcf and config and db:
+            try:
+                logging.info("Executing autonomous tasks...")
+                execute_autonomous_tasks(
+                    user_id="default_user", 
+                    memory_instance=memory_instance,
+                    gmail_service=gmail_service,
+                    llm_client=llm_client_gcf,
+                    config=config,
+                    db_client=db
+                )
+                logging.info("Autonomous tasks completed successfully.")
+            except Exception as e_auto:
+                logging.error(f"Error during execute_autonomous_tasks: {e_auto}", exc_info=True)
+        else:
+            logging.warning("Skipping autonomous tasks due to missing dependencies (memory, gmail, llm, config, or db).")
+        # --- *** END NEW: EXECUTE AUTONOMOUS TASKS *** ---
+        
     except Exception as e:
         logging.critical(f"Failed during Gmail Authentication: {e}", exc_info=True)
         return "Error: Gmail Auth Failed", 500
@@ -754,6 +1235,24 @@ def process_emails_gcf(request):
                 # Log results
                 logging.info(f"  Processing Result for {email_id}: Priority='{processed_email_data.get('priority')}', Summary='{str(processed_email_data.get('summary'))[:100]}...', LLM Purpose='{processed_email_data.get('llm_purpose')}'")
 
+                # --- *** NEW: AUTO-CATEGORIZATION *** ---
+                if memory_instance and memory_instance.user_profile.get("agent_preferences", {}).get("allow_auto_categorization", False):
+                    labels_to_add = []
+                    priority_label = processed_email_data.get('priority')
+                    purpose_label = processed_email_data.get('llm_purpose')
+
+                    if priority_label and priority_label != 'N/A':
+                        labels_to_add.append(f"Maia/Priority/{priority_label.capitalize()}")
+                    if purpose_label and purpose_label != 'Unknown':
+                        # Sanitize purpose for label (e.g., "Action Request" -> "Action-Request")
+                        sanitized_purpose = purpose_label.replace(" ", "-")
+                        labels_to_add.append(f"Maia/Purpose/{sanitized_purpose.capitalize()}")
+                    
+                    if labels_to_add:
+                        logging.info(f"Auto-categorization: Requesting to apply labels {labels_to_add} to email {email_id}")
+                        database_utils.request_email_action(email_id, "apply_label", params={"labels_to_add": labels_to_add})
+                # --- *** END NEW: AUTO-CATEGORIZATION *** ---
+
                 # Database Saving
                 if add_processed_email(processed_email_data):
                     logging.info(f"  Email {email_id} processed and saved to Firestore.")
@@ -769,7 +1268,17 @@ def process_emails_gcf(request):
         logging.info(f"\nFinished processing batch. Processed {new_emails_processed_count} new emails.")
         # --- End Process Emails Loop ---
         
-
+    # --- *** NEW: FINAL ACTION REQUESTS PROCESSING *** ---
+    if gmail_service:
+        try:
+            logging.info("Processing final action requests...")
+            process_action_requests(gmail_service)
+            logging.info("Final action requests processed successfully.")
+        except Exception as e_final:
+            logging.error(f"Error during final action requests processing: {e_final}", exc_info=True)
+    else:
+        logging.warning("Gmail service not available, cannot process final action requests.")
+    # --- *** END NEW: FINAL ACTION REQUESTS PROCESSING *** ---
 
     # --- Report Generation (Log Only) ---
     # (Keep report generation loop as implemented previously)

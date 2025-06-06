@@ -262,27 +262,26 @@ def get_todays_high_priority_emails(db_client=None): # db_client param is not us
 
     try:
         today_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        query = db.collection(EMAILS_COLLECTION)\
-                  .where(filter=FieldFilter('processed_timestamp', '>=', today_utc))\
-                  .where(filter=FieldFilter('priority', 'in', [PRIORITY_CRITICAL, PRIORITY_HIGH]))\
-                  .order_by('processed_timestamp', direction=firestore.Query.DESCENDING)
+        query = (db.collection(EMAILS_COLLECTION) # Using parentheses for clarity
+                  .where(filter=FieldFilter('processed_timestamp', '>=', today_utc))
+                  .where(filter=FieldFilter('priority', 'in', [PRIORITY_CRITICAL, PRIORITY_HIGH])) 
+                  .order_by('processed_timestamp', direction=firestore.Query.DESCENDING))
 
         results = query.stream()
         for doc in results:
             email_data = doc.to_dict()
-            email_data['email_id'] = doc.id 
+            email_data['email_id'] = doc.id
             emails.append(email_data)
 
     except google_exceptions.FailedPrecondition as e:
-         # This specific exception often indicates a missing index
-         logging.error(f"Firestore query failed, likely requires an index: {e}", exc_info=True)
-         logging.error("Please check the error message for a link to create the necessary composite index in the Google Cloud Console.")
+        logging.error(f"Firestore query failed, likely requires an index: {e}", exc_info=True)
+        logging.error("Please check the error message for a link to create the necessary composite index in the Google Cloud Console.")
     except google_exceptions.GoogleAPICallError as e:
         logging.error(f"Firestore API error retrieving today's high priority emails: {e}", exc_info=True)
     except Exception as e:
         logging.error(f"Unexpected error retrieving today's high priority emails: {e}", exc_info=True)
 
-    return emails # Return list of dictionaries
+    return emails
 
 # --- Functions for Retraining State ---
 
