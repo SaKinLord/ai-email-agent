@@ -37,7 +37,7 @@ fsspec==2025.5.1
 functions-framework==3.8.2
 gitdb==4.0.12
 GitPython==3.1.44
-google-ai-generativelanguage==0.6.18
+google-ai-generativelanguage==0.6.15
 google-api-core==2.24.2
 google-api-python-client==2.166.0
 google-auth==2.38.0
@@ -48,7 +48,7 @@ google-cloud-firestore==2.20.2
 google-cloud-secret-manager==2.23.3
 google-cloud-storage==3.1.0
 google-crc32c==1.7.1
-google-generativeai==0.8.4
+google-generativeai==0.8.5
 google-resumable-media==2.7.2
 googleapis-common-protos==1.69.2
 greenlet==3.2.2
@@ -76,7 +76,7 @@ jsonschema-specifications==2024.10.1
 langchain==0.3.25
 langchain-community==0.3.24
 langchain-core==0.3.59
-langchain-google-genai==2.1.4
+langchain-google-genai==2.0.10
 langchain-openai==0.3.17
 langchain-text-splitters==0.3.8
 langcodes==3.5.0
