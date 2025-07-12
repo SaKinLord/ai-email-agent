@@ -1,0 +1,46 @@
+# .gcloudignore
+
+# Python'un derlenmiş dosyaları ve önbelleği
+__pycache__/
+*.pyc
+
+# Sanal ortam klasörü
+venv/
+/venv/
+.venv/
+/.venv/
+
+# Test dosyaları ve klasörleri
+test_*.py
+tests/
+test/
+
+# Yedek dosyalar
+*_backup.py
+
+# Yerel konfigürasyon ve hassas dosyalar
+# Bunlar zaten deploy edilmemeli, ama garantiye alalım.
+.env
+credentials.json
+service-account-key.json
+service-account-firestore.json
+token.json
+calendar_token.json
+
+# IDE ve OS'a özel dosyalar
+.vscode/
+.idea/
+.DS_Store
+
+# Git dosyaları
+.git/
+.gitignore
+
+# Diğer dokümantasyon ve arşivler
+README.md
+TROUBLESHOOTING.md
+CLAUDE.md
+CLAUDE_ARCHIVE.md
+IMPLEMENTATION_GUIDE.md
+package-lock.json
+package.json

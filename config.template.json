@@ -1,0 +1,114 @@
+{
+    "gmail": {
+        "scopes": [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.modify"
+        ],
+
+        "token_path": "token.json",
+        "credentials_path": "credentials.json",
+        "fetch_max_results": 150,
+        "fetch_labels": [ "INBOX", "UNREAD" ]
+    },
+    "llm": {
+        "provider": "anthropic",
+        "api_key_env_var": "ANTHROPIC_API_KEY",
+        "model_name": "claude-3-haiku-20240307",
+        "analysis_max_input_chars": 4500,
+        "analysis_max_tokens": 100,
+        "analysis_temperature": 0.6,
+        "summary_max_input_chars": 9000,
+        "summary_max_tokens": 150,
+        "summary_temperature": 0.5,
+        "api_delay_seconds": 2
+    },
+    "classification": {
+        "important_senders": [
+            "boss@example.com",
+            "ceo@example.com",
+            "important.client@example.com",
+            "@critical-vendor.com",
+            "linkedin.com"
+        ],
+        "subject_keywords_high": [
+            "urgent",
+            "action required",
+            "important",
+            "meeting request",
+            "deadline",
+            "başvuru",
+            "talent",
+            "staj",
+            "internship",
+            "Remote"
+        ],
+        "subject_keywords_low": [
+            "newsletter",
+            "promotion",
+            "update",
+            "social",
+            "notification",
+            "digest"
+        ],
+        "sender_keywords_low": [
+            "noreply",
+            "newsletter",
+            "notifications",
+            "support",
+            "marketing",
+            "linkedin.com",
+            "tradingview.com",
+            "coderspace.io"
+        ]
+    },
+    "database": {
+        "filepath": "email_agent_memory.db"
+    },
+    "ml": {
+        "pipeline_filename": "feature_pipeline.joblib",
+        "label_encoder_filename": "label_encoder.joblib",
+        "min_feedback_for_retrain": 5
+    },
+    "retraining": {
+        "enabled": true,
+        "trigger_feedback_count": 10,
+        "state_filepath": "retrain_state.json"
+    },
+    "llm_settings": {
+        "model": "claude-3-haiku-20240307",
+        "max_tokens": 1000,
+        "hybrid_mode": true,
+        "gpt_budget_monthly": 120.0,
+        "claude_budget_monthly": 5.0
+    },
+    "autonomous_tasks": {
+        "auto_archive": { "enabled": true, "confidence_threshold": 0.95 },
+        "auto_meeting_prep": { "enabled": true, "confidence_threshold": 0.90 },
+        "auto_task_creation": { "enabled": true, "confidence_threshold": 0.90 }
+    },
+    "integrations": {
+        "task_webhook_url": "https://webhook.site/unique-id-here",
+        "reply_suggestions": {
+            "enabled": true,
+            "max_suggestions": 3,
+            "exclude_purposes": ["promotion", "social", "newsletter"]
+        },
+        "webhook_settings": {
+            "timeout_seconds": 30,
+            "verify_ssl": true
+        }
+    },
+    "reasoning": {
+        "enabled": true,
+        "explanation_detail_level": "standard",
+        "confidence_thresholds": { "archive": 95, "priority_adjust": 80 }
+    },
+    "agenda_synthesis": {
+        "enabled": true,
+        "max_emails": 5,
+        "max_tasks": 10,
+        "max_events": 8,
+        "refresh_interval_minutes": 30,
+        "fallback_enabled": true
+    }
+}
