@@ -280,8 +280,6 @@ python test_backend_fixes.py
 
 ```
 process_emails_gcf_function-source/
-├── 📄 CLAUDE.md                    # AI assistant instructions
-├── 📄 Software_Design_Document.md   # Technical documentation
 ├── 📄 config.json                  # Main configuration file
 ├── 📄 config.template.json         # Configuration template
 ├── 📄 requirements.txt             # Python dependencies
@@ -392,7 +390,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 For support and questions:
 - 📧 Create an issue in the GitHub repository
-- 📖 Check the Software_Design_Document.md for technical details
 - 🔍 Review CLAUDE.md for AI assistant guidance
 
 ---
