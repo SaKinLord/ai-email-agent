@@ -158,6 +158,6 @@
     "retraining": {
         "enabled": true,
         "state_filepath": "retrain_state.json",
-        "trigger_feedback_count": 10
+        "trigger_feedback_count": 50
     }
 }
